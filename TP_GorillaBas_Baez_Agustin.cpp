@@ -1,3 +1,12 @@
+/*
+Autor: Agustin Baez
+Carrera: Ing. informatica
+Año: 2026
+Programa: creacion de juego basado en "Gorilla.bash"
+*/
+
+
+
 
 #include <windows.h> // Permite crear ventanas, botones, campos de texto, timers y dibujar usando GDI.
 #include <cmath>     // Permite usar sin, cos, sqrt y round para la trayectoria parabolica.
