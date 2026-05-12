@@ -1,7 +1,7 @@
 /*
 Autor: Agustin Baez
 Carrera: Ing. informatica
-Año: 2026
+Año: 2026.
 Programa: creacion de juego basado en "Gorilla.bash"
 */
 
