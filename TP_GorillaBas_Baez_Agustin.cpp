@@ -29,7 +29,7 @@ const int ALTO_MUNDO = ALTO_VENTANA - ALTO_PANEL;
 // CAMBIO MANUAL 2 -edificios 
 const int CANTIDAD_EDIFICIOS = 21;//antes 18
 //Cambio manual 3: Regla del juego
-const int PUNTOS_PARA_GANAR = 3; // Mejor de tres
+const int PUNTOS_PARA_GANAR = 4; // Mejor de 4 
 
 const double PI = 3.14159265358979323846;
 
@@ -37,7 +37,7 @@ const double PI = 3.14159265358979323846;
 // Con un valor mas bajo hay arcos mas largos y es posible acertar a distancia.
 
 //Cambio manual 1- Gravedad
-const double GRAVEDAD = 28.0; //antes 32.0
+const double GRAVEDAD = 9.8; //se cambio a 9.8
 
 // Identificadores de controles.
 // Windows los usa para reconocer que boton o campo genero un evento.
@@ -450,7 +450,7 @@ void actualizarProyectil() {
 
   
 // CAMBIO MANUAL 1 - EFECTO DEL VIENTO
-double viento = 0.06; //antes 0.09
+double viento = 0.99; //antes 0.09  a ahora a 0.99 para que el viento tenga un efecto más sutil y permita tiros más predecibles, pero aún así influya en la trayectoria.
 
 proyectil.x = proyectil.xInicial +
               (proyectil.vx + viento * proyectil.tiempo) * proyectil.tiempo;
