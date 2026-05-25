@@ -8,14 +8,20 @@ Programa: creacion de juego basado en "Gorilla.bash"
 
 
 
+#include <winsock2.h> // Permite conectar dos computadoras por TCP/IP.
+#include <ws2tcpip.h> // Permite convertir direcciones IP escritas por el usuario.
 #include <windows.h> // Permite crear ventanas, botones, campos de texto, timers y dibujar usando GDI.
 #include <cmath>     // Permite usar sin, cos, sqrt y round para la trayectoria parabolica.
 #include <ctime>     // Permite usar time(), util para generar valores aleatorios distintos.
 #include <cstdlib>   // Permite usar srand() y rand() para variar alturas y estrellas.
+#include <iomanip>   // Permite enviar textos con espacios dentro de los mensajes de red.
+#include <sstream>   // Permite armar y leer mensajes de red.
 #include <string>    // Permite usar string para nombres y mensajes del juego.
 #include <vector>    // Permite usar vector para guardar la lista de edificios .
 
 using namespace std;
+
+#pragma comment(lib, "ws2_32.lib")
 
 // -----------------------------
 // Constantes generales del juego
@@ -45,7 +51,18 @@ const int ID_ANGULO = 101;
 const int ID_VELOCIDAD = 102;
 const int ID_DISPARAR = 103;
 const int ID_REINICIAR = 104;
+const int ID_IP = 105;
+const int ID_HOST = 106;
+const int ID_UNIRSE = 107;
+const int ID_SOLITARIO = 108;
+const int ID_MULTIJUGADOR = 109;
+const int ID_VOLVER_MENU = 110;
+const int ID_PUERTO = 111;
+const int ID_NOMBRE = 112;
+const int ID_DESCONECTAR = 113;
 const int ID_TIMER = 200;
+const UINT WM_RED_MENSAJE = WM_APP + 1;
+const int PUERTO_RED_DEFECTO = 8080;
 
 // -----------------------------
 // Estructuras de datos
@@ -92,6 +109,15 @@ HWND campoAngulo;
 HWND campoVelocidad;
 HWND botonDisparar;
 HWND botonReiniciar;
+HWND campoIP;
+HWND botonHost;
+HWND botonUnirse;
+HWND botonSolitario;
+HWND botonMultijugador;
+HWND botonVolverMenu;
+HWND campoPuerto;
+HWND campoNombre;
+HWND botonDesconectar;
 
 vector<Edificio> edificios;
 vector<Crater> crateres;
@@ -105,6 +131,31 @@ bool rondaTerminada = false;
 bool partidaTerminada = false;
 string mensajeEstado = "Turno del Jugador 1";
 string ganadorPartida = "";
+string mensajeMenuMultijugador = "";
+
+enum ModoRed {
+    RED_LOCAL,
+    RED_HOST,
+    RED_CLIENTE
+};
+
+enum PantallaActual {
+    PANTALLA_MENU,
+    PANTALLA_MENU_MULTIJUGADOR,
+    PANTALLA_JUEGO
+};
+
+ModoRed modoRed = RED_LOCAL;
+PantallaActual pantallaActual = PANTALLA_MENU;
+SOCKET socketRed = INVALID_SOCKET;
+SOCKET socketEscucha = INVALID_SOCKET;
+HANDLE hiloRed = NULL;
+bool redConectada = false;
+bool esperandoConexion = false;
+bool winsockIniciado = false;
+bool procesandoDisparoRemoto = false;
+int puertoRed = PUERTO_RED_DEFECTO;
+CRITICAL_SECTION seccionEnvioRed;
 
 // -----------------------------
 // Prototipado de funciones
@@ -117,6 +168,27 @@ void dibujarTexto(HDC hdc, int x, int y, const string& texto);
 double leerNumero(HWND campo, double valorPorDefecto);
 double leerNumeroLimitado(HWND campo, double valorPorDefecto, double minimo, double maximo);
 int obtenerTechoEnX(int x);
+void enviarEstadoRed();
+void enviarMensajeRed(const string& mensaje);
+void procesarMensajeRed(const string& mensaje);
+string crearMensajeEstado();
+void aplicarMensajeEstado(const string& mensaje);
+void iniciarHostRed();
+void iniciarClienteRed();
+void cerrarRed();
+bool esTurnoLocal();
+int leerPuertoRed();
+string obtenerIPsLocales();
+void mostrarMenuInicio();
+void mostrarMenuMultijugador();
+void mostrarPantallaJuego();
+void iniciarModoSolitario();
+void iniciarModoHost();
+void iniciarModoCliente();
+void desconectarYVolverAlMenu();
+DWORD WINAPI hiloHostRed(LPVOID parametro);
+DWORD WINAPI hiloClienteRed(LPVOID parametro);
+DWORD WINAPI hiloRecepcionRed(LPVOID parametro);
 
 void generarEdificios();
 void suavizarEdificiosCercanos(int indiceJugador, bool miraHaciaDerecha);
@@ -143,6 +215,7 @@ void dibujarProyectil(HDC hdc);
 void dibujarPanel(HDC hdc);
 void dibujarGameOver(HDC hdc);
 void dibujarEscenario(HDC hdc);
+void dibujarMenu(HDC hdc);
 
 LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LPARAM lParam);
 
@@ -201,6 +274,594 @@ int obtenerTechoEnX(int x) {
     }
 
     return ALTO_MUNDO;
+}
+
+bool esTurnoLocal() {
+    if (modoRed == RED_LOCAL) {
+        return true;
+    }
+
+    return (modoRed == RED_HOST && turnoActual == 1) ||
+           (modoRed == RED_CLIENTE && turnoActual == 2);
+}
+
+int leerPuertoRed() {
+    char buffer[32];
+    GetWindowTextA(campoPuerto, buffer, 32);
+
+    int puerto = PUERTO_RED_DEFECTO;
+
+    try {
+        puerto = stoi(buffer);
+    } catch (...) {
+        puerto = PUERTO_RED_DEFECTO;
+    }
+
+    if (puerto < 1024 || puerto > 65535) {
+        puerto = PUERTO_RED_DEFECTO;
+    }
+
+    SetWindowTextA(campoPuerto, to_string(puerto).c_str());
+    return puerto;
+}
+
+string obtenerIPsLocales() {
+    char nombreEquipo[256];
+    string resultado = "IP local del servidor: ";
+    bool encontroIP = false;
+
+    if (gethostname(nombreEquipo, sizeof(nombreEquipo)) == 0) {
+        hostent* host = gethostbyname(nombreEquipo);
+
+        if (host != NULL) {
+            for (int i = 0; host->h_addr_list[i] != NULL; i++) {
+                in_addr direccion;
+                memcpy(&direccion, host->h_addr_list[i], sizeof(in_addr));
+                string ip = inet_ntoa(direccion);
+
+                if (ip.rfind("127.", 0) == 0) {
+                    continue;
+                }
+
+                if (encontroIP) {
+                    resultado += " / ";
+                }
+
+                resultado += ip;
+                encontroIP = true;
+            }
+        }
+    }
+
+    if (!encontroIP) {
+        resultado += "no detectada";
+    }
+
+    return resultado;
+}
+
+void actualizarControlesPorTurno() {
+    if (pantallaActual != PANTALLA_JUEGO) {
+        EnableWindow(botonDisparar, FALSE);
+        return;
+    }
+
+    bool redPermiteJugar = (modoRed == RED_LOCAL) || redConectada;
+    bool puedeDisparar = !rondaTerminada &&
+                         !partidaTerminada &&
+                         !proyectil.activo &&
+                         redPermiteJugar &&
+                         esTurnoLocal();
+
+    EnableWindow(botonDisparar, puedeDisparar ? TRUE : FALSE);
+}
+
+void mostrarMenuInicio() {
+    pantallaActual = PANTALLA_MENU;
+    modoRed = RED_LOCAL;
+    mensajeMenuMultijugador = "";
+    esperandoConexion = false;
+    redConectada = false;
+
+    ShowWindow(campoAngulo, SW_HIDE);
+    ShowWindow(campoVelocidad, SW_HIDE);
+    ShowWindow(botonDisparar, SW_HIDE);
+    ShowWindow(botonReiniciar, SW_HIDE);
+    ShowWindow(campoIP, SW_HIDE);
+    ShowWindow(campoPuerto, SW_HIDE);
+    ShowWindow(campoNombre, SW_HIDE);
+    ShowWindow(botonHost, SW_HIDE);
+    ShowWindow(botonUnirse, SW_HIDE);
+    ShowWindow(botonVolverMenu, SW_HIDE);
+    ShowWindow(botonDesconectar, SW_HIDE);
+
+    ShowWindow(botonSolitario, SW_SHOW);
+    ShowWindow(botonMultijugador, SW_SHOW);
+    EnableWindow(botonSolitario, TRUE);
+    EnableWindow(botonMultijugador, TRUE);
+    EnableWindow(campoNombre, TRUE);
+    EnableWindow(campoIP, TRUE);
+    EnableWindow(botonHost, TRUE);
+    EnableWindow(botonUnirse, TRUE);
+
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+}
+
+void mostrarMenuMultijugador() {
+    pantallaActual = PANTALLA_MENU_MULTIJUGADOR;
+
+    ShowWindow(botonSolitario, SW_HIDE);
+    ShowWindow(botonMultijugador, SW_HIDE);
+    ShowWindow(campoAngulo, SW_HIDE);
+    ShowWindow(campoVelocidad, SW_HIDE);
+    ShowWindow(botonDisparar, SW_HIDE);
+    ShowWindow(botonReiniciar, SW_HIDE);
+
+    MoveWindow(campoNombre, 395, 295, 210, 28, TRUE);
+    MoveWindow(campoIP, 395, 365, 210, 28, TRUE);
+    MoveWindow(botonHost, 330, 440, 160, 38, TRUE);
+    MoveWindow(botonUnirse, 520, 440, 150, 38, TRUE);
+    MoveWindow(botonVolverMenu, 430, 505, 140, 34, TRUE);
+
+    ShowWindow(campoIP, SW_SHOW);
+    ShowWindow(campoPuerto, SW_HIDE);
+    ShowWindow(campoNombre, SW_SHOW);
+    ShowWindow(botonHost, SW_SHOW);
+    ShowWindow(botonUnirse, SW_SHOW);
+    ShowWindow(botonVolverMenu, SW_SHOW);
+    ShowWindow(botonDesconectar, SW_HIDE);
+    bool esperando = esperandoConexion || redConectada;
+    EnableWindow(botonHost, esperando ? FALSE : TRUE);
+    EnableWindow(botonUnirse, esperando ? FALSE : TRUE);
+    EnableWindow(botonVolverMenu, TRUE);
+    EnableWindow(campoNombre, esperando ? FALSE : TRUE);
+    EnableWindow(campoIP, esperando ? FALSE : TRUE);
+
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+}
+
+void mostrarPantallaJuego() {
+    pantallaActual = PANTALLA_JUEGO;
+
+    ShowWindow(botonSolitario, SW_HIDE);
+    ShowWindow(botonMultijugador, SW_HIDE);
+    ShowWindow(botonVolverMenu, SW_HIDE);
+
+    MoveWindow(botonDesconectar, 820, ALTO_MUNDO + 70, 145, 34, TRUE);
+
+    ShowWindow(campoAngulo, SW_SHOW);
+    ShowWindow(campoVelocidad, SW_SHOW);
+    ShowWindow(botonDisparar, SW_SHOW);
+    ShowWindow(botonReiniciar, SW_SHOW);
+
+    bool esMultijugador = modoRed != RED_LOCAL;
+    ShowWindow(campoIP, SW_HIDE);
+    ShowWindow(campoPuerto, SW_HIDE);
+    ShowWindow(campoNombre, SW_HIDE);
+    ShowWindow(botonHost, SW_HIDE);
+    ShowWindow(botonUnirse, SW_HIDE);
+    ShowWindow(botonDesconectar, esMultijugador ? SW_SHOW : SW_HIDE);
+    EnableWindow(botonHost, FALSE);
+    EnableWindow(botonUnirse, FALSE);
+    EnableWindow(botonDesconectar, esMultijugador ? TRUE : FALSE);
+
+    actualizarControlesPorTurno();
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+}
+
+void iniciarModoSolitario() {
+    cerrarRed();
+    modoRed = RED_LOCAL;
+    jugador1.nombre = "Jugador 1";
+    jugador2.nombre = "Jugador 2";
+    iniciarNuevaPartida();
+    mostrarPantallaJuego();
+}
+
+void iniciarModoHost() {
+    char bufferNombre[64];
+    GetWindowTextA(campoNombre, bufferNombre, 64);
+    string nombre = bufferNombre;
+
+    if (nombre.empty()) {
+        nombre = "Jugador 1";
+    }
+
+    modoRed = RED_HOST;
+    jugador1.nombre = nombre;
+    jugador2.nombre = "Jugador 2";
+    mensajeMenuMultijugador = "Creando servidor...";
+    mostrarMenuMultijugador();
+    iniciarHostRed();
+}
+
+void iniciarModoCliente() {
+    char bufferNombre[64];
+    GetWindowTextA(campoNombre, bufferNombre, 64);
+    string nombre = bufferNombre;
+
+    if (nombre.empty()) {
+        nombre = "Jugador 2";
+    }
+
+    modoRed = RED_CLIENTE;
+    jugador1.nombre = "Jugador 1";
+    jugador2.nombre = nombre;
+    mensajeMenuMultijugador = "Conectando al servidor...";
+    mostrarMenuMultijugador();
+    iniciarClienteRed();
+}
+
+void desconectarYVolverAlMenu() {
+    cerrarRed();
+    modoRed = RED_LOCAL;
+    mensajeEstado = "Conexion cerrada.";
+    mostrarMenuInicio();
+}
+
+bool iniciarWinsockSiHaceFalta() {
+    if (winsockIniciado) {
+        return true;
+    }
+
+    WSADATA datos;
+    if (WSAStartup(MAKEWORD(2, 2), &datos) != 0) {
+        MessageBoxA(ventanaPrincipal, "No se pudo iniciar Winsock.", "Error de red", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    winsockIniciado = true;
+    return true;
+}
+
+void enviarMensajeRed(const string& mensaje) {
+    if (!redConectada || socketRed == INVALID_SOCKET) {
+        return;
+    }
+
+    string linea = mensaje + "\n";
+    const char* datos = linea.c_str();
+    int enviados = 0;
+    int total = static_cast<int>(linea.size());
+
+    EnterCriticalSection(&seccionEnvioRed);
+
+    while (enviados < total) {
+        int resultado = send(socketRed, datos + enviados, total - enviados, 0);
+
+        if (resultado == SOCKET_ERROR || resultado == 0) {
+            break;
+        }
+
+        enviados += resultado;
+    }
+
+    LeaveCriticalSection(&seccionEnvioRed);
+}
+
+string crearMensajeEstado() {
+    ostringstream salida;
+
+    salida << "STATE "
+           << turnoActual << ' '
+           << rondaTerminada << ' '
+           << partidaTerminada << ' '
+           << quoted(mensajeEstado) << ' '
+           << quoted(ganadorPartida) << ' '
+           << quoted(jugador1.nombre) << ' '
+           << quoted(jugador2.nombre) << ' '
+           << jugador1.victorias << ' '
+           << jugador2.victorias << ' '
+           << proyectil.activo << ' '
+           << proyectil.x << ' '
+           << proyectil.y << ' '
+           << proyectil.xInicial << ' '
+           << proyectil.yInicial << ' '
+           << proyectil.vx << ' '
+           << proyectil.vy << ' '
+           << proyectil.tiempo << ' '
+           << edificios.size();
+
+    for (const Edificio& edificio : edificios) {
+        salida << ' ' << edificio.x
+               << ' ' << edificio.ancho
+               << ' ' << edificio.alto
+               << ' ' << static_cast<unsigned long>(edificio.color);
+    }
+
+    salida << ' ' << crateres.size();
+
+    for (const Crater& crater : crateres) {
+        salida << ' ' << crater.x
+               << ' ' << crater.y
+               << ' ' << crater.radio;
+    }
+
+    return salida.str();
+}
+
+void aplicarMensajeEstado(const string& mensaje) {
+    istringstream entrada(mensaje);
+    string tipo;
+    size_t cantidadEdificios = 0;
+    size_t cantidadCrateres = 0;
+    unsigned long color = 0;
+
+    entrada >> tipo;
+
+    if (tipo != "STATE") {
+        return;
+    }
+
+    entrada >> turnoActual
+            >> rondaTerminada
+            >> partidaTerminada
+            >> quoted(mensajeEstado)
+            >> quoted(ganadorPartida)
+            >> quoted(jugador1.nombre)
+            >> quoted(jugador2.nombre)
+            >> jugador1.victorias
+            >> jugador2.victorias
+            >> proyectil.activo
+            >> proyectil.x
+            >> proyectil.y
+            >> proyectil.xInicial
+            >> proyectil.yInicial
+            >> proyectil.vx
+            >> proyectil.vy
+            >> proyectil.tiempo
+            >> cantidadEdificios;
+
+    if (entrada.fail()) {
+        return;
+    }
+
+    edificios.clear();
+
+    for (size_t i = 0; i < cantidadEdificios; i++) {
+        Edificio edificio;
+        entrada >> edificio.x >> edificio.ancho >> edificio.alto >> color;
+        edificio.color = static_cast<COLORREF>(color);
+        edificios.push_back(edificio);
+    }
+
+    entrada >> cantidadCrateres;
+    crateres.clear();
+
+    for (size_t i = 0; i < cantidadCrateres; i++) {
+        Crater crater;
+        entrada >> crater.x >> crater.y >> crater.radio;
+        crateres.push_back(crater);
+    }
+
+    colocarJugadores();
+    actualizarControlesPorTurno();
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+}
+
+void enviarEstadoRed() {
+    if (modoRed == RED_HOST && redConectada) {
+        enviarMensajeRed(crearMensajeEstado());
+    }
+}
+
+void procesarMensajeRed(const string& mensaje) {
+    if (mensaje.rfind("STATE ", 0) == 0) {
+        if (modoRed == RED_CLIENTE && pantallaActual != PANTALLA_JUEGO) {
+            mostrarPantallaJuego();
+        }
+
+        aplicarMensajeEstado(mensaje);
+        return;
+    }
+
+    if (mensaje.rfind("NAME|", 0) == 0 && modoRed == RED_HOST) {
+        string nombre = mensaje.substr(5);
+
+        if (!nombre.empty()) {
+            jugador2.nombre = nombre;
+            iniciarNuevaPartida();
+            mostrarPantallaJuego();
+            mensajeEstado = nombre + " se conecto. Turno de " + jugador1.nombre + ".";
+            enviarEstadoRed();
+            InvalidateRect(ventanaPrincipal, NULL, TRUE);
+        }
+
+        return;
+    }
+
+    if (mensaje.rfind("SHOOT ", 0) == 0 && modoRed == RED_HOST && turnoActual == 2 && !proyectil.activo) {
+        istringstream entrada(mensaje);
+        string tipo;
+        double angulo;
+        double velocidad;
+
+        entrada >> tipo >> angulo >> velocidad;
+
+        if (!entrada.fail()) {
+            SetWindowTextA(campoAngulo, to_string(static_cast<int>(angulo)).c_str());
+            SetWindowTextA(campoVelocidad, to_string(static_cast<int>(velocidad)).c_str());
+            procesandoDisparoRemoto = true;
+            disparar();
+            procesandoDisparoRemoto = false;
+        }
+
+        return;
+    }
+
+    if (mensaje == "RESTART" && modoRed == RED_HOST) {
+        if (partidaTerminada) {
+            iniciarNuevaPartida();
+        } else {
+            iniciarNuevaRonda();
+        }
+
+        enviarEstadoRed();
+    }
+}
+
+DWORD WINAPI hiloRecepcionRed(LPVOID parametro) {
+    SOCKET socketConexion = reinterpret_cast<SOCKET>(parametro);
+    string acumulado;
+    char buffer[512];
+
+    while (true) {
+        int recibidos = recv(socketConexion, buffer, sizeof(buffer), 0);
+
+        if (recibidos <= 0) {
+            break;
+        }
+
+        acumulado.append(buffer, recibidos);
+
+        size_t posicionSalto = string::npos;
+        while ((posicionSalto = acumulado.find('\n')) != string::npos) {
+            string linea = acumulado.substr(0, posicionSalto);
+            acumulado.erase(0, posicionSalto + 1);
+
+            string* mensaje = new string(linea);
+            PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(mensaje));
+        }
+    }
+
+    string* mensaje = new string("DISCONNECT");
+    PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(mensaje));
+    return 0;
+}
+
+DWORD WINAPI hiloHostRed(LPVOID parametro) {
+    SOCKET escucha = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (escucha == INVALID_SOCKET) {
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    sockaddr_in direccion = {};
+    direccion.sin_family = AF_INET;
+    direccion.sin_addr.s_addr = INADDR_ANY;
+    direccion.sin_port = htons(static_cast<u_short>(puertoRed));
+
+    BOOL reutilizar = TRUE;
+    setsockopt(escucha, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reutilizar), sizeof(reutilizar));
+
+    if (bind(escucha, reinterpret_cast<sockaddr*>(&direccion), sizeof(direccion)) == SOCKET_ERROR ||
+        listen(escucha, 1) == SOCKET_ERROR) {
+        closesocket(escucha);
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    socketEscucha = escucha;
+    SOCKET cliente = accept(escucha, NULL, NULL);
+    closesocket(escucha);
+    socketEscucha = INVALID_SOCKET;
+
+    if (cliente == INVALID_SOCKET) {
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    socketRed = cliente;
+    PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("CONNECTED")));
+    hiloRecepcionRed(reinterpret_cast<LPVOID>(cliente));
+    return 0;
+}
+
+DWORD WINAPI hiloClienteRed(LPVOID parametro) {
+    string direccionHost = *reinterpret_cast<string*>(parametro);
+    delete reinterpret_cast<string*>(parametro);
+
+    SOCKET conexion = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (conexion == INVALID_SOCKET) {
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    sockaddr_in servidor = {};
+    servidor.sin_family = AF_INET;
+    servidor.sin_port = htons(static_cast<u_short>(puertoRed));
+    servidor.sin_addr.s_addr = inet_addr(direccionHost.c_str());
+
+    if (servidor.sin_addr.s_addr == INADDR_NONE) {
+        closesocket(conexion);
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    if (connect(conexion, reinterpret_cast<sockaddr*>(&servidor), sizeof(servidor)) == SOCKET_ERROR) {
+        closesocket(conexion);
+        PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("NET_ERROR")));
+        return 0;
+    }
+
+    socketRed = conexion;
+    PostMessage(ventanaPrincipal, WM_RED_MENSAJE, 0, reinterpret_cast<LPARAM>(new string("CONNECTED")));
+    hiloRecepcionRed(reinterpret_cast<LPVOID>(conexion));
+    return 0;
+}
+
+void iniciarHostRed() {
+    if (!iniciarWinsockSiHaceFalta() || esperandoConexion || redConectada) {
+        return;
+    }
+
+    puertoRed = leerPuertoRed();
+    modoRed = RED_HOST;
+    esperandoConexion = true;
+    mensajeMenuMultijugador = obtenerIPsLocales() + "  |  Puerto: " + to_string(puertoRed) +
+                               ". Esperando al otro jugador...";
+    EnableWindow(botonHost, FALSE);
+    EnableWindow(botonUnirse, FALSE);
+    EnableWindow(campoNombre, FALSE);
+    EnableWindow(campoIP, FALSE);
+    actualizarControlesPorTurno();
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+
+    hiloRed = CreateThread(NULL, 0, hiloHostRed, NULL, 0, NULL);
+}
+
+void iniciarClienteRed() {
+    if (!iniciarWinsockSiHaceFalta() || esperandoConexion || redConectada) {
+        return;
+    }
+
+    char bufferIP[64];
+    GetWindowTextA(campoIP, bufferIP, 64);
+
+    puertoRed = leerPuertoRed();
+    modoRed = RED_CLIENTE;
+    esperandoConexion = true;
+    mensajeMenuMultijugador = "Conectando al servidor...";
+    EnableWindow(botonHost, FALSE);
+    EnableWindow(botonUnirse, FALSE);
+    EnableWindow(campoNombre, FALSE);
+    EnableWindow(campoIP, FALSE);
+    actualizarControlesPorTurno();
+    InvalidateRect(ventanaPrincipal, NULL, TRUE);
+
+    hiloRed = CreateThread(NULL, 0, hiloClienteRed, new string(bufferIP), 0, NULL);
+}
+
+void cerrarRed() {
+    redConectada = false;
+    esperandoConexion = false;
+
+    if (socketEscucha != INVALID_SOCKET) {
+        closesocket(socketEscucha);
+        socketEscucha = INVALID_SOCKET;
+    }
+
+    if (socketRed != INVALID_SOCKET) {
+        closesocket(socketRed);
+        socketRed = INVALID_SOCKET;
+    }
+
+    if (winsockIniciado) {
+        WSACleanup();
+        winsockIniciado = false;
+    }
 }
 
 // -----------------------------
@@ -279,14 +940,16 @@ void iniciarNuevaRonda() {
     proyectil.tiempo = 0.0;
     turnoActual = 1;
     rondaTerminada = false;
-    mensajeEstado = "Turno del Jugador 1";
+    mensajeEstado = "Turno de " + jugador1.nombre;
 
-    EnableWindow(botonDisparar, TRUE);
+    actualizarControlesPorTurno();
     SetWindowTextA(botonReiniciar, "Reiniciar ronda");
 
     if (ventanaPrincipal != NULL) {
         InvalidateRect(ventanaPrincipal, NULL, TRUE);
     }
+
+    enviarEstadoRed();
 }
 
 void iniciarNuevaPartida() {
@@ -358,9 +1021,10 @@ void terminarPartida(const string& ganador) {
     mensajeEstado = "Game Over: gano " + ganador + " al mejor de tres.";
 
     KillTimer(ventanaPrincipal, ID_TIMER);
-    EnableWindow(botonDisparar, FALSE);
+    actualizarControlesPorTurno();
     SetWindowTextA(botonReiniciar, "Nueva partida");
     InvalidateRect(ventanaPrincipal, NULL, TRUE);
+    enviarEstadoRed();
 }
 
 void terminarRonda(int ganador) {
@@ -376,7 +1040,7 @@ void terminarRonda(int ganador) {
             return;
         }
 
-        mensajeEstado = "Gana la ronda el Jugador 1. Presione Reiniciar ronda.";
+        mensajeEstado = "Gana la ronda " + jugador1.nombre + ". Presione Reiniciar ronda.";
     } else {
         jugador2.victorias++;
 
@@ -385,11 +1049,12 @@ void terminarRonda(int ganador) {
             return;
         }
 
-        mensajeEstado = "Gana la ronda el Jugador 2. Presione Reiniciar ronda.";
+        mensajeEstado = "Gana la ronda " + jugador2.nombre + ". Presione Reiniciar ronda.";
     }
 
-    EnableWindow(botonDisparar, FALSE);
+    actualizarControlesPorTurno();
     InvalidateRect(ventanaPrincipal, NULL, TRUE);
+    enviarEstadoRed();
 }
 
 // -----------------------------
@@ -398,8 +1063,9 @@ void terminarRonda(int ganador) {
 
 void cambiarTurno() {
     turnoActual = (turnoActual == 1) ? 2 : 1;
-    mensajeEstado = (turnoActual == 1) ? "Turno del Jugador 1" : "Turno del Jugador 2";
-    EnableWindow(botonDisparar, TRUE);
+    mensajeEstado = (turnoActual == 1) ? "Turno de " + jugador1.nombre : "Turno de " + jugador2.nombre;
+    actualizarControlesPorTurno();
+    enviarEstadoRed();
 }
 
 void disparar() {
@@ -411,7 +1077,19 @@ void disparar() {
     // CAMBIO MANUAL 1 - VELOCIDAD INICIAL AJUSTADA
     double velocidad = leerNumeroLimitado(campoVelocidad, 110.0, 10.0, 220.0); //antes 90.0, 10.0, 220.0
 
-   
+    if (!procesandoDisparoRemoto && !esTurnoLocal()) {
+        return;
+    }
+
+    if (!procesandoDisparoRemoto && modoRed == RED_CLIENTE) {
+        ostringstream salida;
+        salida << "SHOOT " << angulo << ' ' << velocidad;
+        enviarMensajeRed(salida.str());
+        mensajeEstado = "Disparo enviado al host...";
+        actualizarControlesPorTurno();
+        InvalidateRect(ventanaPrincipal, NULL, TRUE);
+        return;
+    }
 
     Jugador tirador = (turnoActual == 1) ? jugador1 : jugador2;
     Jugador objetivo = (turnoActual == 1) ? jugador2 : jugador1;
@@ -436,7 +1114,8 @@ void disparar() {
 mensajeEstado = "Angulo: " + to_string((int)angulo) + 
                 " | Velocidad: " + to_string((int)velocidad);
 
-    EnableWindow(botonDisparar, FALSE);
+    actualizarControlesPorTurno();
+    enviarEstadoRed();
 
     SetTimer(ventanaPrincipal, ID_TIMER, 30, NULL);
 }
@@ -493,6 +1172,7 @@ proyectil.x = proyectil.xInicial +
     }
 
     InvalidateRect(ventanaPrincipal, NULL, TRUE);
+    enviarEstadoRed();
 }
 
 // -----------------------------
@@ -625,10 +1305,20 @@ void dibujarPanel(HDC hdc) {
 
     dibujarTexto(hdc, 20, ALTO_MUNDO + 12, mensajeEstado);
     dibujarTexto(hdc, 20, ALTO_MUNDO + 38,
-                 "Mejor de 3  |  Jugador 1: " + to_string(jugador1.victorias) +
-                 "  Jugador 2: " + to_string(jugador2.victorias));
+                 "Mejor de 3  |  " + jugador1.nombre + ": " + to_string(jugador1.victorias) +
+                 "  " + jugador2.nombre + ": " + to_string(jugador2.victorias));
     dibujarTexto(hdc, 20, ALTO_MUNDO + 78, "Angulo:");
     dibujarTexto(hdc, 190, ALTO_MUNDO + 78, "Velocidad:");
+
+    string estadoRed = "Modo: local";
+
+    if (modoRed == RED_HOST) {
+        estadoRed = redConectada ? "Modo: host conectado" : "Modo: host esperando";
+    } else if (modoRed == RED_CLIENTE) {
+        estadoRed = redConectada ? "Modo: cliente conectado" : "Modo: cliente conectando";
+    }
+
+    dibujarTexto(hdc, 725, ALTO_MUNDO + 12, estadoRed);
     
     
 
@@ -681,6 +1371,63 @@ void dibujarEscenario(HDC hdc) {
     dibujarGameOver(hdc);
 }
 
+void dibujarMenu(HDC hdc) {
+    HBRUSH fondo = CreateSolidBrush(RGB(0, 0, 25));
+    RECT area = {0, 0, ANCHO_VENTANA, ALTO_VENTANA};
+    FillRect(hdc, &area, fondo);
+    DeleteObject(fondo);
+
+    HBRUSH estrella = CreateSolidBrush(RGB(245, 245, 210));
+
+    for (int i = 0; i < 90; i++) {
+        int x = (i * 113 + 57) % ANCHO_VENTANA;
+        int y = (i * 67 + 31) % ALTO_VENTANA;
+        RECT punto = {x, y, x + 2, y + 2};
+        FillRect(hdc, &punto, estrella);
+    }
+
+    DeleteObject(estrella);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 225, 95));
+
+    HFONT fuenteTitulo = CreateFontA(
+        58, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial"
+    );
+    HFONT fuenteTexto = CreateFontA(
+        22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial"
+    );
+
+    HGDIOBJ fuenteAnterior = SelectObject(hdc, fuenteTitulo);
+    dibujarTexto(hdc, 315, 145, "Gorillas C++");
+
+    SelectObject(hdc, fuenteTexto);
+    SetTextColor(hdc, RGB(235, 235, 240));
+
+    if (pantallaActual == PANTALLA_MENU) {
+        dibujarTexto(hdc, 330, 230, "Elija un modo de juego");
+    } else {
+        dibujarTexto(hdc, 290, 210, "Multijugador en red local");
+        dibujarTexto(hdc, 240, 250, "Una PC crea el servidor y la otra se une usando la IP que aparece.");
+        dibujarTexto(hdc, 285, 297, "Nombre:");
+        dibujarTexto(hdc, 285, 367, "IP servidor:");
+
+        if (!mensajeMenuMultijugador.empty()) {
+            dibujarTexto(hdc, 130, 560, mensajeMenuMultijugador);
+        } else {
+            dibujarTexto(hdc, 210, 560, "Al crear servidor se mostrara la IP local para la otra computadora.");
+        }
+    }
+
+    SelectObject(hdc, fuenteAnterior);
+    DeleteObject(fuenteTitulo);
+    DeleteObject(fuenteTexto);
+}
+
 LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LPARAM lParam) {
     switch (mensaje) {
         case WM_CREATE: {
@@ -714,7 +1461,70 @@ LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LP
                 hwnd, (HMENU)ID_REINICIAR, NULL, NULL
             );
 
-            iniciarNuevaPartida();
+            campoIP = CreateWindowA(
+                "EDIT", "127.0.0.1",
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                775, ALTO_MUNDO + 37, 120, 26,
+                hwnd, (HMENU)ID_IP, NULL, NULL
+            );
+
+            campoPuerto = CreateWindowA(
+                "EDIT", "8080",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
+                910, ALTO_MUNDO + 37, 70, 26,
+                hwnd, (HMENU)ID_PUERTO, NULL, NULL
+            );
+
+            campoNombre = CreateWindowA(
+                "EDIT", "Jugador 2",
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                350, 365, 210, 28,
+                hwnd, (HMENU)ID_NOMBRE, NULL, NULL
+            );
+
+            botonHost = CreateWindowA(
+                "BUTTON", "Crear servidor",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                710, ALTO_MUNDO + 70, 145, 34,
+                hwnd, (HMENU)ID_HOST, NULL, NULL
+            );
+
+            botonUnirse = CreateWindowA(
+                "BUTTON", "Unirse",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                805, ALTO_MUNDO + 70, 90, 34,
+                hwnd, (HMENU)ID_UNIRSE, NULL, NULL
+            );
+
+            botonSolitario = CreateWindowA(
+                "BUTTON", "Solitario",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                365, 315, 270, 48,
+                hwnd, (HMENU)ID_SOLITARIO, NULL, NULL
+            );
+
+            botonMultijugador = CreateWindowA(
+                "BUTTON", "Multijugador",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                365, 385, 270, 48,
+                hwnd, (HMENU)ID_MULTIJUGADOR, NULL, NULL
+            );
+
+            botonVolverMenu = CreateWindowA(
+                "BUTTON", "Volver",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                430, 420, 140, 34,
+                hwnd, (HMENU)ID_VOLVER_MENU, NULL, NULL
+            );
+
+            botonDesconectar = CreateWindowA(
+                "BUTTON", "Desconectar",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                820, ALTO_MUNDO + 70, 145, 34,
+                hwnd, (HMENU)ID_DESCONECTAR, NULL, NULL
+            );
+
+            mostrarMenuInicio();
             return 0;
         }
 
@@ -724,11 +1534,73 @@ LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LP
             if (idControl == ID_DISPARAR) {
                 disparar();
             } else if (idControl == ID_REINICIAR) {
-                if (partidaTerminada) {
-                    iniciarNuevaPartida();
+                if (modoRed == RED_CLIENTE) {
+                    enviarMensajeRed("RESTART");
                 } else {
-                    iniciarNuevaRonda();
+                    if (partidaTerminada) {
+                        iniciarNuevaPartida();
+                    } else {
+                        iniciarNuevaRonda();
+                    }
                 }
+            } else if (idControl == ID_HOST) {
+                iniciarModoHost();
+            } else if (idControl == ID_UNIRSE) {
+                iniciarModoCliente();
+            } else if (idControl == ID_SOLITARIO) {
+                iniciarModoSolitario();
+            } else if (idControl == ID_MULTIJUGADOR) {
+                mostrarMenuMultijugador();
+            } else if (idControl == ID_VOLVER_MENU) {
+                cerrarRed();
+                mostrarMenuInicio();
+            } else if (idControl == ID_DESCONECTAR) {
+                desconectarYVolverAlMenu();
+            }
+
+            return 0;
+        }
+
+        case WM_RED_MENSAJE: {
+            string* mensajeRed = reinterpret_cast<string*>(lParam);
+            string texto = *mensajeRed;
+            delete mensajeRed;
+
+            if (texto == "CONNECTED") {
+                redConectada = true;
+                esperandoConexion = false;
+
+                if (modoRed == RED_HOST) {
+                    mensajeMenuMultijugador = "Jugador conectado. Esperando su nombre...";
+                } else {
+                    mensajeMenuMultijugador = "Conectado. Enviando nombre...";
+                    enviarMensajeRed("NAME|" + jugador2.nombre);
+                }
+
+                actualizarControlesPorTurno();
+                InvalidateRect(hwnd, NULL, TRUE);
+            } else if (texto == "DISCONNECT") {
+                redConectada = false;
+                esperandoConexion = false;
+                cerrarRed();
+                mensajeEstado = "Conexion cerrada.";
+                modoRed = RED_LOCAL;
+                EnableWindow(botonHost, TRUE);
+                EnableWindow(botonUnirse, TRUE);
+                mostrarMenuInicio();
+            } else if (texto == "NET_ERROR") {
+                redConectada = false;
+                esperandoConexion = false;
+                cerrarRed();
+                mensajeMenuMultijugador = "No se pudo conectar. Revise que la IP sea de la misma red y que el servidor este creado.";
+                modoRed = RED_LOCAL;
+                EnableWindow(botonHost, TRUE);
+                EnableWindow(botonUnirse, TRUE);
+                EnableWindow(campoNombre, TRUE);
+                EnableWindow(campoIP, TRUE);
+                mostrarMenuMultijugador();
+            } else {
+                procesarMensajeRed(texto);
             }
 
             return 0;
@@ -743,12 +1615,19 @@ LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LP
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            dibujarEscenario(hdc);
+
+            if (pantallaActual == PANTALLA_JUEGO) {
+                dibujarEscenario(hdc);
+            } else {
+                dibujarMenu(hdc);
+            }
+
             EndPaint(hwnd, &ps);
             return 0;
         }
 
         case WM_DESTROY:
+            cerrarRed();
             PostQuitMessage(0);
             return 0;
     }
@@ -759,6 +1638,8 @@ LRESULT CALLBACK ProcedimientoVentana(HWND hwnd, UINT mensaje, WPARAM wParam, LP
 int main() {
     HINSTANCE hInstance = GetModuleHandle(NULL);
     int nCmdShow = SW_SHOW;
+
+    InitializeCriticalSection(&seccionEnvioRed);
 
     srand(static_cast<unsigned int>(time(NULL)));
 
@@ -811,5 +1692,6 @@ int main() {
         DispatchMessage(&mensaje);
     }
 
+    DeleteCriticalSection(&seccionEnvioRed);
     return 0;
 }
